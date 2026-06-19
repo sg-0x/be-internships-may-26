@@ -1,7 +1,5 @@
-import { insertSignal, getByIdemKey, listSignals } from './db.js';
-import { checkAndConsume } from './rateLimit.js';
-
-function nowMs(){ return Date.now(); }
+import { getByIdemKey, insertSignal, insertSignalIfAbsent, listSignals, withRetry } from './db.js';
+import { checkRateLimit } from './rateLimit.js';
 
 export async function postSignal(req, reply) {
   const idem = req.headers['idempotency-key'] || null;
@@ -10,18 +8,47 @@ export async function postSignal(req, reply) {
     return reply.code(400).send({ error: 'invalid_body' });
   }
 
-  const { ok, remaining, resetMs } = checkAndConsume(userId, nowMs());
-  if (!ok) return reply.code(429).send({ error: 'rate_limited', remaining, resetMs });
-
-  if (idem) {
-    const existing = getByIdemKey(idem);
-    if (existing) return existing;
+  const rateLimit = checkRateLimit(userId);
+  if (!rateLimit.allowed) {
+    reply.header('Retry-After', String(rateLimit.retryAfter));
+    return reply.code(429).send({ error: 'rate_limited' });
   }
 
   try {
-    const t = nowMs();
-    const info = insertSignal(userId, type, payload, idem, t);
-    return { id: info.lastInsertRowid, userId, type, payload: String(payload), idempotencyKey: idem, createdAt: t };
+    const createdAt = Date.now();
+
+    if (idem) {
+      const info = await withRetry(() => insertSignalIfAbsent(userId, type, payload, idem, createdAt));
+
+      if (info.changes === 0) {
+        const existing = await withRetry(() => getByIdemKey(idem));
+
+        if (!existing) {
+          throw new Error('idempotency_lookup_failed');
+        }
+
+        return reply.code(200).send(existing);
+      }
+
+      return reply.code(201).send({
+        id: info.lastInsertRowid,
+        userId,
+        type,
+        payload: String(payload),
+        idempotencyKey: idem,
+        createdAt,
+      });
+    }
+
+    const info = await withRetry(() => insertSignal(userId, type, payload, null, createdAt));
+    return reply.code(201).send({
+      id: info.lastInsertRowid,
+      userId,
+      type,
+      payload: String(payload),
+      idempotencyKey: null,
+      createdAt,
+    });
   } catch (e) {
     req.log.error({ err: e, ctx: 'insertSignal' });
     return reply.code(503).send({ error: 'db_unavailable' });
@@ -33,8 +60,8 @@ export async function getSignals(req, reply) {
   if (!userId) return reply.code(400).send({ error: 'missing_userId' });
   const lim = Math.min(Number(limit) || 20, 100);
   try {
-    const rows = listSignals(userId, lim);
-    return { items: rows };
+    const rows = await withRetry(() => listSignals(userId, lim));
+    return rows;
   } catch (e) {
     req.log.error({ err: e, ctx: 'listSignals' });
     return reply.code(503).send({ error: 'db_unavailable' });

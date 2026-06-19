@@ -1,34 +1,35 @@
-# Signals Challenge (Node.js + Fastify)
+# Signals Service
 
-Build a minimal production-leaning service that can **handle load**, **rate limit**, and **avoid duplicates** via idempotency.
+## Setup
 
-## Endpoints (to keep)
-- `POST /v1/signals`
-  - body: `{ "userId": "string", "type": "string", "payload": "string" }`
-  - headers: `X-API-Key`, `Idempotency-Key` (optional)
-  - behaviors:
-    - **Rate limit** per `userId`: `RATE_LIMIT_PER_MIN` per minute (default 5).
-    - **Idempotency**: same `Idempotency-Key` should not create duplicates.
-- `GET /v1/signals?userId=...&limit=...`
-- `GET /healthz`
+1. `npm install`
+2. `cp .env.example .env`
+3. `node src/server.js`
 
-## Your Tasks
-1. **Implement a robust rate limiter** in `src/rateLimit.js`.
-2. **Make idempotency safe across scale** in `src/signals.js`.
-3. **Handle DB failure** gracefully with retry/backoff.
-4. **Think for 10k RPS.** Add a `SCALE.md`.
-5. **Finish the tests** in `tests/*.test.js`.
+The service listens on `PORT` and stores data in the SQLite database configured by `DATABASE_URL`.
 
-## Deliverables
-- Working service, passing tests, updated README, SCALE.md.
-- Optional deploy link.
----
+## Endpoints
 
-## Extra Production Constraints (must pass)
+| Method | Path | Required headers | Notes | Response codes |
+| --- | --- | --- | --- | --- |
+| `GET` | `/healthz` | none | Liveness check | `200` |
+| `POST` | `/v1/signals` | `X-API-Key` | Accepts `{ "userId": "string", "type": "string", "payload": "string" }`. Optional `Idempotency-Key` returns the original resource on duplicate requests. | `201`, `200`, `400`, `401`, `429`, `503` |
+| `GET` | `/v1/signals?userId=...&limit=...` | `X-API-Key` | Lists recent signals for one user. `limit` defaults to `20` and is capped at `100`. | `200`, `400`, `401`, `503` |
 
-- **Atomic Idempotency:** Survive concurrent requests and restarts. Avoid check-then-insert races; use a DB-level unique constraint or atomic upsert pattern. Return the same resource for identical `Idempotency-Key`.
-- **Concurrency-Safe Rate Limit:** Must behave correctly under burst and parallel calls. Naive in-memory counters that race will fail hidden checks. Explain how this becomes multi-instance safe.
-- **Transient DB Failures:** Implement retry/backoff (with jitter) or circuit breaker when DB errors occur (we simulate via `DB_FAIL_RATE`). No duplicates on retry.
-- **Scale Plan (10k RPS):** Fill `SCALE.md` with a clear, concise approach (indexes, pooling, caching, queues, horizontal scale, idempotency store).
+## Configuration
 
-> We will run additional **hidden concurrency/multi-instance tests** during evaluation.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `API_KEY` | `change-me` | Shared key required on all non-health routes |
+| `PORT` | `8080` | HTTP listen port |
+| `DATABASE_URL` | `./data/signals.db` | SQLite database path |
+| `RATE_LIMIT_PER_MIN` | `5` | Fixed-window limit per `userId` |
+| `DB_FAIL_RATE` | `0` | Simulated transient DB failure rate for testing retry behavior |
+
+## Running Tests
+
+Run `node --test`.
+
+## Design Decisions
+
+Idempotency is enforced at the database layer with a unique constraint and `ON CONFLICT DO NOTHING`, which avoids the usual read-before-write race and makes retries safe. Transient database failures go through a small retry wrapper with exponential backoff and full jitter, but only for errors that look temporary, so constraint errors still fail fast. The rate limiter is a fixed window in process because it is simple and deterministic for one Node instance, and the code marks the exact point where it can be replaced with Redis when the service needs to run across many instances.
